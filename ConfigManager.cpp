@@ -11,6 +11,48 @@
 
 namespace ConfigManager {
 
+// ---------------------------------------------------------------------------
+// Registry write helpers
+//
+// On this machine HKCU\Software\drvloader cannot be reopened with KEY_WRITE
+// (RegOpenKeyExW -> 5 ERROR_ACCESS_DENIED) even for the owning user, while
+// setting/deleting values through a handle opened without that right still
+// works.  The original code called RegOpenKeyExW(KEY_WRITE) everywhere and
+// silently returned false, which is why IsPatched stayed 1 forever and every
+// start reported "Found previous patch state in registry".
+//
+// Fix: try the widest access first, then fall back to progressively weaker
+// rights (RegSetValueExW/RegDeleteValueW still succeed on values the caller
+// owns even through a KEY_READ handle).
+// ---------------------------------------------------------------------------
+
+static const wchar_t* kLatestState = L"Software\\drvloader\\LatestState";
+
+static HKEY OpenStateKeyForWrite() {
+    const REGSAM attempts[] = {
+        KEY_ALL_ACCESS,
+        KEY_WRITE | KEY_QUERY_VALUE | KEY_READ,
+        KEY_WRITE,
+        KEY_READ,
+    };
+
+    for (REGSAM access : attempts) {
+        HKEY hKey = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, kLatestState, 0, access, &hKey) == ERROR_SUCCESS)
+            return hKey;
+    }
+
+    // The key may not exist yet.
+    HKEY hKey = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kLatestState, 0, nullptr,
+                        REG_OPTION_NON_VOLATILE,
+                        KEY_WRITE | KEY_QUERY_VALUE | KEY_READ,
+                        nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
+        return hKey;
+    }
+    return nullptr;
+}
+
 std::wstring GetDriversIniPath() {
     WCHAR systemRoot[MAX_PATH];
     DWORD len = GetEnvironmentVariableW(L"SystemRoot", systemRoot, MAX_PATH);
@@ -282,9 +324,10 @@ bool SaveOffsetsToRegistry(uint64_t seCiCallbacks, uint64_t safeFunction, const 
 }
 
 bool SaveOriginalCallbacksToRegistry(const std::vector<uint64_t>& callbacks) {
-    HKEY hKey;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\drvloader\\LatestState", 0, nullptr,
-        REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, nullptr) != ERROR_SUCCESS) {
+    HKEY hKey = OpenStateKeyForWrite();
+    if (!hKey) {
+        std::wcout << L"[!] Cannot open patch-state key for writing (error "
+                   << GetLastError() << L")\n";
         return false;
     }
     
@@ -350,22 +393,57 @@ std::vector<uint64_t> LoadOriginalCallbacksFromRegistry() {
 }
 
 bool ClearPatchStateFromRegistry() {
-    HKEY hKey;
-    
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\drvloader\\LatestState", 0,
-        KEY_WRITE, &hKey) != ERROR_SUCCESS) {
+    HKEY hKey = OpenStateKeyForWrite();
+    if (!hKey) {
+        std::wcout << L"[!] Cannot open patch-state registry key (error "
+                   << GetLastError() << L")\n";
         return false;
     }
-    
-    RegDeleteValueW(hKey, L"OriginalCallback");
-    RegDeleteValueW(hKey, L"PatchTimestamp");
-    
+
+    int removed = 0;
+
+    auto del = [&](const wchar_t* name) {
+        if (RegDeleteValueW(hKey, name) == ERROR_SUCCESS) removed++;
+    };
+
+    del(L"OriginalCallback");
+    del(L"PatchTimestamp");
+
+    // ------------------------------------------------------------------
+    // The multi-slot patch path writes CallbackCount + OriginalCallback0..N.
+    // The original code only removed the singular "OriginalCallback" value,
+    // so those numbered values survived every "clear" and were re-read on the
+    // next start as if a live patch were still in place.
+    // ------------------------------------------------------------------
+    DWORD count = 0;
+    DWORD dataSize = sizeof(DWORD);
+    if (RegQueryValueExW(hKey, L"CallbackCount", nullptr, nullptr,
+                         (BYTE*)&count, &dataSize) == ERROR_SUCCESS) {
+        for (DWORD i = 0; i < count && i < 64; i++) {
+            wchar_t name[32];
+            swprintf_s(name, L"OriginalCallback%u", i);
+            del(name);
+        }
+    }
+    // Defensive: sweep a generous range in case CallbackCount was lost.
+    for (DWORD i = 0; i < 64; i++) {
+        wchar_t name[32];
+        swprintf_s(name, L"OriginalCallback%u", i);
+        RegDeleteValueW(hKey, name); // no counter bump: most will not exist
+    }
+    del(L"CallbackCount");
+    del(L"PatchBootStamp");
+
     DWORD isPatched = 0;
-    RegSetValueExW(hKey, L"IsPatched", 0, REG_DWORD, (BYTE*)&isPatched, sizeof(DWORD));
-    
+    LONG setRc = RegSetValueExW(hKey, L"IsPatched", 0, REG_DWORD,
+                                (BYTE*)&isPatched, sizeof(DWORD));
+    if (setRc != ERROR_SUCCESS) {
+        std::wcout << L"[!] Could not reset IsPatched (error " << setRc << L")\n";
+    }
+
     RegCloseKey(hKey);
-    
-    std::wcout << L"[+] Cleared patch state from registry\n";
+
+    std::wcout << L"[+] Cleared patch state from registry (" << removed << L" value(s) removed)\n";
     return true;
 }
 

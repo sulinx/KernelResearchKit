@@ -32,7 +32,20 @@ public:
     std::vector<uint64_t> originalCallbacks;
     std::optional<uint64_t> patchedCallbackAddr; // base of the patched block
     SymbolDownloader symbolDownloader;
-    
+
+    // ------------------------------------------------------------------
+    // Resident ("hold") mode — added for ARTIFACT compatibility.
+    //
+    // In hold mode the destructor must NOT auto-restore DSE, and the helper
+    // driver (RTCore64) is never unloaded while the patch is live.  ARTIFACT's
+    // artifact.dll installs its own service on top of the same hyperkd.sys we
+    // just loaded; tearing the patch down underneath it kills the game with
+    // 0xC0000096.  `RestoreDSE()` remains available on demand.
+    // ------------------------------------------------------------------
+    bool                                         holdMode{ false };
+    std::wstring                                 heldDriverPath; // driver we loaded, for conflict checks
+    std::wstring                                 heldServiceName;
+
     // Cache for kernel offsets to avoid repeated PDB downloads/parsing
     std::optional<uint64_t> cachedSeCiOffset;
     std::optional<uint64_t> cachedZwFlushOffset;
@@ -68,9 +81,21 @@ public:
     bool CheckDSEStatus(bool& isPatched);
     bool BypassDSE();
     bool RestoreDSE();
-    
+
+    // Resident hold: patch DSE and keep the helper driver loaded until
+    // ExitHold()/RestoreDSE() is called explicitly.  Used by `drvloader hold`.
+    bool EnterHold();
+    // Restore DSE and unload RTCore64.  Safe to call when nothing is held.
+    bool ExitHold();
+
     // Driver Management
     bool LoadDriver(const std::wstring& driverPath, DWORD startType = SERVICE_DEMAND_START, const std::wstring& dependencies = L"");
+    // Same as LoadDriver but keeps the DSE patch alive afterwards (no restore).
+    bool LoadDriverResident(const std::wstring& driverPath, DWORD startType = SERVICE_DEMAND_START, const std::wstring& dependencies = L"");
+private:
+    bool LoadDriverResidentImpl(const std::wstring& driverPath, DWORD startType,
+                                const std::wstring& dependencies, bool resident);
+public:
     bool ReloadDriver(const std::wstring& driverPath);
     bool StopDriver(const std::wstring& serviceNameOrPath);   // New: Stops service without deleting
     bool RemoveDriver(const std::wstring& serviceNameOrPath); // Renamed from UnloadDriver: Stops and deletes

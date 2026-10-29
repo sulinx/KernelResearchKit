@@ -1,0 +1,15 @@
+# Build output
+bin/
+obj/
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.tlog
+*.lastbuildstate
+*.recipe
+*.log
+
+# Local artifacts
+*.user
+._*

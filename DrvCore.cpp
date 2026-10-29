@@ -1,6 +1,7 @@
 #include "DrvCore.h"
 #include "ConfigManager.h"
 #include "ResourceInstaller.h"
+#include "ArtifactCompat.h"
 #include <iostream>
 #include <vector>
 #include <psapi.h>
@@ -218,7 +219,28 @@ static uint64_t ScanSeCiCallbacksFromDisk(const std::wstring& ntoskrnlPath) {
 bool DrvLoader::Initialize() {
     originalCallbacks = ConfigManager::LoadOriginalCallbacksFromRegistry();
     if (!originalCallbacks.empty()) {
-        std::wcout << L"[+] Found previous patch state in registry (" << originalCallbacks.size() << L" callbacks)\n";
+        // ------------------------------------------------------------------
+        // STALE-STATE DETECTION (added for ARTIFACT compatibility)
+        //
+        // The registry survives reboots, the kernel patch does not.  When the
+        // recorded state was written by an earlier boot, there is nothing to
+        // restore: SeCiCallbacks already holds the real CI pointers, and
+        // replaying the stored values plants a dangling address in the table.
+        // On this machine that is exactly how `restore` produced a BSOD.
+        // Drop the state instead of pretending we can undo the patch.
+        // ------------------------------------------------------------------
+        if (ArtifactCompat::IsPatchStateFromCurrentBoot()) {
+            std::wcout << L"[+] Found previous patch state in registry ("
+                       << originalCallbacks.size() << L" callbacks, same boot)\n";
+        } else {
+            std::wcout << L"[!] Registry holds patch state from a PREVIOUS boot ("
+                       << originalCallbacks.size() << L" callbacks)\n";
+            std::wcout << L"[!] Discarding it: the kernel callbacks were reset by the restart,\n";
+            std::wcout << L"[!] so replaying those addresses would corrupt SeCiCallbacks.\n";
+            originalCallbacks.clear();
+            ConfigManager::ClearPatchStateFromRegistry();
+            ArtifactCompat::ClearPatchBootStamp();
+        }
     } else {
         std::wcout << L"[*] No previous patch state found\n";
     }
@@ -232,9 +254,12 @@ bool DrvLoader::Initialize() {
 }
 
 DrvLoader::~DrvLoader() {
-    if (!originalCallbacks.empty()) {
+    if (!originalCallbacks.empty() && !holdMode) {
         std::wcout << L"\n[*] DrvLoader shutting down, auto-restoring DSE...\n";
         RestoreDSE();
+    }
+    else if (!originalCallbacks.empty() && holdMode) {
+        std::wcout << L"[*] Hold mode: leaving DSE patched and RTCore64 loaded\n";
     }
     Cleanup();
 }
@@ -762,6 +787,9 @@ bool DrvLoader::BypassDSEInternal() {
         if (val) originalCallbacks.push_back(*val);
     }
     ConfigManager::SaveOriginalCallbacksToRegistry(originalCallbacks);
+    // Remember WHICH boot produced this state.  After a restart the stored
+    // addresses are stale and must never be replayed (see RestoreDSEInternal).
+    ArtifactCompat::SavePatchBootStamp();
     patchedCallbackAddr = callbackToPatch;
 
     bool patchSuccess = false;
@@ -784,8 +812,9 @@ bool DrvLoader::BypassDSEInternal() {
             if (val) originalCallbacks.push_back(*val);
             else originalCallbacks.push_back(0); // placeholder
         }
-        
+
         ConfigManager::SaveOriginalCallbacksToRegistry(originalCallbacks);
+        ArtifactCompat::SavePatchBootStamp();
         patchedCallbackAddr = callbackToPatch;
         
         std::wcout << L"[*] Attempt 1 failed (KDP/HVCI?). Trying multi-slot forced write...\n";
@@ -854,8 +883,17 @@ bool DrvLoader::BypassDSE() {
 }
 
 bool DrvLoader::LoadDriver(const std::wstring& driverPath, DWORD startType, const std::wstring& dependencies) {
-    std::wcout << L"\n[=== Load Driver ===]\n";
-    
+    return LoadDriverResidentImpl(driverPath, startType, dependencies, false);
+}
+
+bool DrvLoader::LoadDriverResident(const std::wstring& driverPath, DWORD startType,
+                                   const std::wstring& dependencies) {
+    return LoadDriverResidentImpl(driverPath, startType, dependencies, true);
+}
+
+bool DrvLoader::LoadDriverResidentImpl(const std::wstring& driverPath, DWORD startType,
+                                       const std::wstring& dependencies, bool resident) {
+
     std::wstring normalizedPath = ConfigManager::NormalizeDriverPath(driverPath);
     std::wstring serviceName = ConfigManager::ExtractServiceName(normalizedPath);
     
@@ -863,6 +901,34 @@ bool DrvLoader::LoadDriver(const std::wstring& driverPath, DWORD startType, cons
     
     if (GetFileAttributesW(normalizedPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
         std::wcout << L"[-] File not found: " << normalizedPath << L"\n";
+        ConfigManager::SaveDriverLoadHistory(normalizedPath, serviceName, startType, false);
+        return false;
+    }
+
+    // ------------------------------------------------------------------
+    // DOUBLE-LOAD GUARD (added for ARTIFACT compatibility)
+    //
+    // ARTIFACT's artifact.dll installs its OWN kernel service pointing at the
+    // very hyperkd.sys we are about to load.  hyperkd's DriverEntry has no
+    // singleton protection, so a second instance re-initialises the global
+    // hypervisor state and the game then executes VMX instructions in a
+    // corrupt context -> 0xC0000096 STATUS_PRIVILEGED_INSTRUCTION.
+    //
+    // Refuse to load when another service already maps this exact file, and
+    // point the user at the two safe routes: testsigning (let ARTIFACT own the
+    // driver) or removing the other service first.
+    // ------------------------------------------------------------------
+    auto conflicts = ArtifactCompat::FindConflictingServices(normalizedPath, serviceName);
+    if (!conflicts.empty()) {
+        std::wcout << L"\n[!] Refusing to load: this driver is already mapped by another service\n";
+        for (const auto& c : conflicts) {
+            std::wcout << L"    - " << c << L"  (" << ArtifactCompat::GetServiceImagePath(c) << L")\n";
+        }
+        std::wcout << L"[!] hyperkd.sys has no singleton guard - two instances will corrupt the\n";
+        std::wcout << L"[!] hypervisor state and the game will die with 0xC0000096.\n";
+        std::wcout << L"[*] Safe options:\n";
+        std::wcout << L"    1) testsigning is ON -> just let ARTIFACT install the driver itself\n";
+        std::wcout << L"    2) drvloader remove <name>  (for each service listed above), then retry\n";
         ConfigManager::SaveDriverLoadHistory(normalizedPath, serviceName, startType, false);
         return false;
     }
@@ -932,13 +998,97 @@ bool DrvLoader::LoadDriver(const std::wstring& driverPath, DWORD startType, cons
         std::wcout << L"[-] Failed to open SC Manager (error: " << GetLastError() << L")\n";
     }
     
-    // Step 4: Restore DSE
-    RestoreDSEInternal();
-    Cleanup();
-    StopAndRemoveDriver();
+    // Step 4: Restore DSE (only when not holding it open for ARTIFACT)
+    if (resident && serviceSuccess) {
+        // ------------------------------------------------------------------
+        // ARTIFACT compatibility: keep the patch + RTCore64 alive.
+        //
+        // artifact.dll starts later, inside the game process, and installs its
+        // OWN service on top of this driver through the plain SCM path.  If we
+        // restore DSE here (load -> patch -> start -> restore), the SCM start
+        // performed by artifact.dll is rejected with 0x80070241
+        // ERROR_INVALID_IMAGE_HASH because the CI table is enforced again.
+        // Keeping the patch live is what makes the whole chain work.
+        // ------------------------------------------------------------------
+        holdMode          = true;
+        heldDriverPath    = normalizedPath;
+        heldServiceName   = serviceName;
+        std::wcout << L"[*] Resident mode: DSE stays patched, RTCore64 stays loaded\n";
+        std::wcout << L"[*] Run 'drvloader restore' (or 'drvloader stop-hold') when done\n";
+    } else {
+        RestoreDSEInternal();
+        Cleanup();
+        StopAndRemoveDriver();
+    }
     
     ConfigManager::SaveDriverLoadHistory(normalizedPath, serviceName, startType, serviceSuccess);
     return serviceSuccess;
+}
+
+// ============================================================================
+// Hold mode — patch DSE without loading any target driver
+// ============================================================================
+
+bool DrvLoader::EnterHold() {
+    std::wcout << L"\n[=== Hold DSE (resident) ===]\n";
+
+    if (!InstallAndStartDriver()) return false;
+
+    hDriver = CreateFileW(L"\\\\.\\RTCore64", GENERIC_READ | GENERIC_WRITE,
+                          0, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (hDriver == INVALID_HANDLE_VALUE) {
+        std::wcout << L"[-] Failed to open \\\\.\\RTCore64 (error " << GetLastError() << L")\n";
+        StopAndRemoveDriver();
+        return false;
+    }
+
+    // Already patched by an earlier run in this same process/boot?
+    bool alreadyPatched = false;
+    if (!originalCallbacks.empty() && patchedCallbackAddr) {
+        auto cur = ReadMemory64(*patchedCallbackAddr);
+        auto offsets = ResolveKernelOffsetsStrict();
+        if (cur && offsets) {
+            uint64_t safeFn = 0;
+            auto ntBase = GetNtoskrnlBase();
+            if (ntBase) safeFn = *ntBase + offsets->second;
+            alreadyPatched = (safeFn && *cur == safeFn);
+        }
+    }
+
+    if (!alreadyPatched) {
+        if (!BypassDSEInternal()) {
+            std::wcout << L"[-] DSE patch failed\n";
+            Cleanup();
+            StopAndRemoveDriver();
+            return false;
+        }
+    } else {
+        std::wcout << L"[*] DSE already patched - reusing existing patch\n";
+    }
+
+    holdMode = true;
+    std::wcout << L"[+] Hold engaged: DSE is patched and RTCore64 stays loaded\n";
+    std::wcout << L"[+] Services may now be started through the normal SCM path\n";
+    return true;
+}
+
+bool DrvLoader::ExitHold() {
+    std::wcout << L"\n[=== Release Hold ===]\n";
+
+    bool restored = false;
+    if (!originalCallbacks.empty()) {
+        restored = RestoreDSE();
+    } else {
+        std::wcout << L"[*] No patch state held by this process\n";
+        Cleanup();
+        StopAndRemoveDriver();
+        restored = true;
+    }
+
+    holdMode = false;
+    heldDriverPath.clear();
+    heldServiceName.clear();
+    return restored;
 }
 
 bool DrvLoader::ReloadDriver(const std::wstring& driverPath) {
@@ -1090,6 +1240,32 @@ bool DrvLoader::RestoreDSEInternal() {
     if (originalCallbacks.empty()) {
         std::wcout << L"[-] No original callback values available\n";
         return false;
+    }
+
+    // ------------------------------------------------------------------
+    // STALE-STATE GUARD (added for ARTIFACT compatibility)
+    //
+    // `Initialize()` seeds originalCallbacks from HKCU when a previous patch
+    // is recorded, even across reboots.  After a restart those stored kernel
+    // addresses are meaningless: SeCiCallbacks already points at the real CI
+    // functions again, and writing the old values back plants a stale pointer
+    // into the callback slot — which is what produced the 0x0000000A /
+    // freeze we hit while `restore` was run after a reboot.
+    //
+    // Rule: only replay registry state when we know we are in the same boot
+    // that produced it, or when this process patched the slot itself
+    // (patchedCallbackAddr has a value).
+    // ------------------------------------------------------------------
+    if (!patchedCallbackAddr && !ArtifactCompat::IsPatchStateFromCurrentBoot()) {
+        std::wcout << L"[!] Ignoring patch state from a previous boot\n";
+        std::wcout << L"[!] The kernel callback table was reset by the restart, so there is\n";
+        std::wcout << L"[!] nothing to restore - replaying the stored addresses would write a\n";
+        std::wcout << L"[!] stale pointer into SeCiCallbacks and can bugcheck the machine.\n";
+        originalCallbacks.clear();
+        ConfigManager::ClearPatchStateFromRegistry();
+        ArtifactCompat::ClearPatchBootStamp();
+        std::wcout << L"[+] Stale patch state discarded; DSE is already ACTIVE\n";
+        return true;
     }
 
     // Determine the exact address to restore.

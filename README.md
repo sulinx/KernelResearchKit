@@ -4,9 +4,38 @@
 [![Bypass Technique: SeCiCallbacks Patch](https://img.shields.io/badge/Bypass%20Technique-SeCiCallbacks%20Patch-orange?style=for-the-badge)](https://github.com/CodeStartUp/KernelResearchKit)
 [![Helper Driver: RTCore64 (MSI)](https://img.shields.io/badge/Helper%20Driver-RTCore64%20(MSI)-red?style=for-the-badge)](https://github.com/CodeStartUp/KernelResearchKit)
 [![Language: C++](https://img.shields.io/badge/Language-C%2B%2B-blue?style=for-the-badge&logo=c%2B%2B&logoColor=white)](https://github.com/CodeStartUp/KernelResearchKit)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](file:///c:/Users/Lalit/OneDrive/Documents/KernelResearchKit/LICENSE)
 
 **DrvLoader** is an advanced Windows kernel research utility designed to bypass **Driver Signature Enforcement (DSE)** on the latest builds of Windows 11 (including Build 26200+). By utilizing surgical manipulation of the kernel's Code Integrity (`CI.dll`) callback structure via the `RTCore64.sys` read/write primitive, DrvLoader enables researchers to load unsigned drivers without enabling Test Signing mode or disabling Secure Boot.
+
+> ### 🔀 This fork: ARTIFACT compatibility
+>
+> Upstream assumes **DrvLoader owns the driver**: patch DSE → start the driver →
+> restore immediately. That model breaks on the ARTIFACT loaders shipped with
+> hypervisor-protected games (Phantom Blade Zero, Crimson Desert, …), where
+> `artifact.dll` **installs its own kernel service on top of the very same
+> `hyperkd.sys`** later, from inside the game process.
+>
+> This fork adds three things upstream cannot do:
+>
+> | Command | What it does |
+> |---|---|
+> | `drvloader hold [--load <sys>]` | Patch DSE and **keep it patched** — no destructor auto-restore, RTCore64 stays loaded |
+> | `drvloader artifact <dir\|json> [--launch] [--hold]` | Parse `artifact.json`, verify the environment, optionally launch and wait |
+> | `drvloader compat [<dir\|json>]` | **Read-only** readiness check — no kernel access, safe to run anywhere |
+>
+> It also fixes two defects that produce hard-to-diagnose crashes:
+>
+> *   **Double-load guard.** Loading `hyperkd.sys` while another service already
+>     maps the same file is refused. `hyperkd`'s `DriverEntry` has no singleton
+>     protection, so a second instance re-initialises the global hypervisor state
+>     and the game dies with `0xC0000096 STATUS_PRIVILEGED_INSTRUCTION`.
+> *   **Stale patch state.** The registry survives reboots, the kernel patch does
+>     not. A boot stamp is now recorded alongside the callback table, and state
+>     written by an earlier boot is discarded instead of being replayed — replaying
+>     those addresses plants a dangling pointer into `SeCiCallbacks` and
+>     bugchecks the machine.
+>
+> See [ARTIFACT-COMPAT.md](ARTIFACT-COMPAT.md) for the full write-up.
 
 ---
 
