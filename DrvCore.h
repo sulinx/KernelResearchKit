@@ -79,6 +79,9 @@ public:
     
     // DSE Status and Manipulation
     bool CheckDSEStatus(bool& isPatched);
+    // Pure-read DSE inspection: never installs/uninstalls drivers, never
+    // patches.  Safe to call while a `hold` is live (status() is not).
+    bool ReadDSEOnly(bool& isPatched);
     bool BypassDSE();
     bool RestoreDSE();
 
@@ -108,6 +111,7 @@ private:
     bool InstallAndStartDriver();
     bool StopAndRemoveDriver();
     bool CheckDriverFileExists();
+    bool DriverServiceExists(const std::wstring& serviceName);
     
     // Internal DSE helpers
     bool BypassDSEInternal();

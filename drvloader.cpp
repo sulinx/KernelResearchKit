@@ -42,6 +42,7 @@ int HandleAutoLoadCommand(DrvLoader& loader);
 int HandleHoldCommand(DrvLoader& loader, int argc, wchar_t* argv[]);
 int HandleArtifactCommand(DrvLoader& loader, int argc, wchar_t* argv[]);
 int HandleCompatCheckCommand(int argc, wchar_t* argv[]);
+int HandleDseCommand(DrvLoader& loader);
 void ShowHelp();
 
 int wmain(int argc, wchar_t* argv[]) {
@@ -75,6 +76,9 @@ int wmain(int argc, wchar_t* argv[]) {
         }
         else if (cmd == L"status") {
             return HandleStatusCommand(loader);
+        }
+        else if (cmd == L"dse") {
+            return HandleDseCommand(loader);
         }
         else if (cmd == L"load") {
             return HandleLoadCommand(loader, argc, argv);
@@ -187,6 +191,57 @@ int HandleStatusCommand(DrvLoader& loader) {
     bool isPatched = false;
     if (loader.CheckDSEStatus(isPatched)) return 0;
     return 1;
+}
+
+// drvloader dse
+//   READ-ONLY DSE query.  Unlike `status` it never installs, uninstalls or
+//   patches anything, so it is safe to run while a `hold` is live.
+//   Exit codes: 0 = PATCHED, 1 = ACTIVE, 2 = cannot read (no RTCore64).
+int HandleDseCommand(DrvLoader& loader) {
+    std::wcout << L"\n[=== DSE State (read-only) ===]\n";
+
+    bool rtcoreLoaded = false;
+    {
+        SC_HANDLE hSCM = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+        if (hSCM) {
+            SC_HANDLE hSvc = OpenServiceW(hSCM, L"RTCore64", SERVICE_QUERY_STATUS);
+            rtcoreLoaded = (hSvc != nullptr);
+            if (hSvc) CloseServiceHandle(hSvc);
+            CloseServiceHandle(hSCM);
+        }
+    }
+
+    if (!rtcoreLoaded) {
+        std::wcout << L"[-] RTCore64 service is not present\n";
+        std::wcout << L"[!] Cannot read the live CI callback table without it.\n";
+        std::wcout << L"[!] DSE is therefore ENFORCED (nothing has patched it in this boot).\n";
+        std::wcout << L"\n[=>] DSE = ACTIVE (inferred)\n";
+        return 1;
+    }
+
+    // Open the existing device.  Do NOT create the service here — that is
+    // exactly what makes `status` destructive during a hold.
+    loader.hDriver = CreateFileW(L"\\\\.\\RTCore64", GENERIC_READ | GENERIC_WRITE,
+                                 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (loader.hDriver == INVALID_HANDLE_VALUE) {
+        std::wcout << L"[-] RTCore64 service exists but the device cannot be opened (error "
+                   << GetLastError() << L")\n";
+        std::wcout << L"\n[=>] DSE = UNKNOWN\n";
+        return 2;
+    }
+
+    bool isPatched = false;
+    bool ok = loader.ReadDSEOnly(isPatched);
+    loader.Cleanup();
+
+    if (!ok) {
+        std::wcout << L"\n[=>] DSE = UNKNOWN\n";
+        return 2;
+    }
+
+    std::wcout << L"\n[=>] DSE = " << (isPatched ? L"PATCHED (signature enforcement disabled)"
+                                                 : L"ACTIVE (signature enforcement on)") << L"\n";
+    return isPatched ? 0 : 1;
 }
 
 int HandleLoadCommand(DrvLoader& loader, int argc, wchar_t* argv[]) {
@@ -521,6 +576,7 @@ void ShowHelp() {
     std::wcout << L"  bypass                 Disable DSE\n";
     std::wcout << L"  restore                Enable DSE\n";
     std::wcout << L"  status                 Check DSE status\n";
+    std::wcout << L"  dse                    Read-only DSE state (safe during hold)\n";
     std::wcout << L"  load <path>            Load driver (Stop -> Patch -> Start -> Restore)\n";
     std::wcout << L"  load <path> -s <0-4>   Load with specific StartType\n";
     std::wcout << L"  reload <driver>        Reload driver\n";
